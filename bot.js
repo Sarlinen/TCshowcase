@@ -20,20 +20,13 @@ function saveData(d) { fs.writeFileSync(DATA_PATH, JSON.stringify(d, null, 2)); 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
 // ── 보석 아이템 판별 ────────────────────────────────────────────────────────────
-// Steam 보석의 실제 type: "Gem" (낱개), "Gem" (주머니도 동일)
-// market_hash_name: "Gems" (낱개), "Sack of Gems" (주머니)
 function isGemItem(item) {
   const name = (item.market_hash_name || item.name || '').toLowerCase();
   const type = (item.type || '').toLowerCase();
   const tags  = item.tags || [];
 
-  // 1. market_hash_name 기준 (가장 확실)
   if (name === 'gems' || name === 'sack of gems') return true;
-
-  // 2. type 기준
   if (type === 'gem' || type === 'steam gems' || type === 'gems') return true;
-
-  // 3. tags의 item_class_7 (Steam Gem class)
   if (tags.some(t => t.internal_name === 'item_class_7')) return true;
 
   return false;
@@ -44,7 +37,6 @@ function isSackOfGems(item) {
   return name.includes('sack') && name.includes('gem');
 }
 
-// 보석 수량 계산 (주머니는 1000개)
 function getGemCount(item) {
   if (isSackOfGems(item)) {
     return (parseInt(item.amount) || 1) * 1000;
@@ -52,7 +44,7 @@ function getGemCount(item) {
   return parseInt(item.amount) || 1;
 }
 
-// ── 관리자 인벤토리 조회 (봇 community 쿠키 사용 → 403 없음) ───────────────────
+// ── 관리자 인벤토리 조회 ────────────────────────────────────────────────────────
 function fetchInventoryViaCommunity(community, steamId) {
   return new Promise((resolve, reject) => {
     community.getUserInventoryContents(steamId, 753, 6, true, 'english', (err, items) => {
@@ -62,7 +54,6 @@ function fetchInventoryViaCommunity(community, steamId) {
   });
 }
 
-// 트레이딩 카드 필터 (노말만, 포일 제외)
 function filterTradingCards(items) {
   return items.filter(item => {
     const type = (item.type || '').toLowerCase();
@@ -72,7 +63,6 @@ function filterTradingCards(items) {
   });
 }
 
-// appId 추출
 function getAppIdFromItem(item) {
   if (item.market_fee_app) return String(item.market_fee_app);
   const tags = item.tags || [];
@@ -84,6 +74,7 @@ function getAppIdFromItem(item) {
   return null;
 }
 
+// ── 봇 클래스 ──────────────────────────────────────────────────────────────────
 class SteamBot {
   constructor() {
     this.client      = new SteamUser();
@@ -187,7 +178,6 @@ class SteamBot {
       const partnerId = offer.partner.toString();
       this.log(`새 거래 수신 — 파트너: ${partnerId}`);
 
-      // 관리자 거래 → 자동 수락
       if (adminSteamId && partnerId === adminSteamId) {
         this.log('관리자 거래 감지 → 자동 수락');
         offer.accept((err, status) => {
@@ -197,7 +187,6 @@ class SteamBot {
           setTimeout(() => this._syncBotInventory(), 5000);
         });
       } else {
-        // 그 외 모든 수신 거래 즉시 거부
         this.log(`외부 거래 거부 — 파트너: ${partnerId}`);
         offer.decline((err) => {
           if (err) this.log(`거래 거부 실패: ${err.message}`);
@@ -212,7 +201,6 @@ class SteamBot {
         this.log(`거래 완료! ID: ${offer.id}`);
         this._handleTradeCompleted(offer);
       }
-      // 역제안 → 자동 거부
       if (offer.state === SteamTradeOfferManager.ETradeOfferState.Countered) {
         this.log('역제안 감지 → 자동 거부');
         offer.decline((err) => {
@@ -295,7 +283,6 @@ class SteamBot {
   }
 
   // ── 전체 재고보충 ─────────────────────────────────────────────────────────────
-  // 관리자 인벤토리에서 완성 세트가 되는 카드만 골라 봇이 관리자에게 거래 요청
   async sendRestockOfferAll() {
     if (!this.isLoggedIn) throw new Error('봇이 로그인되어 있지 않습니다.');
 
@@ -306,7 +293,6 @@ class SteamBot {
 
     this.log(`전체 재고보충 시작 — 관리자: ${adminSteamId}`);
 
-    // 1. 관리자 인벤토리 수집 (봇 community 쿠키 → 403 없음)
     let allItems;
     try {
       allItems = await fetchInventoryViaCommunity(this.community, adminSteamId);
@@ -318,14 +304,12 @@ class SteamBot {
     if (cards.length === 0) throw new Error('관리자 인벤토리에 노말 트레이딩 카드가 없습니다.');
     this.log(`관리자 인벤토리: 총 ${cards.length}장 노말 트레이딩 카드 발견`);
 
-    // 2. data.json 세트 크기 정보 로드
     const data       = loadData();
     const setInfoMap = {};
     for (const s of (data.sets || [])) {
       if (s.appId && s.cardsInSet) setInfoMap[String(s.appId)] = s.cardsInSet;
     }
 
-    // 3. 게임별 그룹화 { appId: { classid: [item, ...] } }
     const gameMap = {};
     for (const card of cards) {
       const appId = getAppIdFromItem(card);
@@ -338,7 +322,6 @@ class SteamBot {
     const appIds = Object.keys(gameMap);
     this.log(`게임 ${appIds.length}종 감지 — 세트 크기 검증 중`);
 
-    // 4. 완성 세트가 되는 카드만 선별
     const cardsToSend = [];
     const summary     = [];
 
@@ -346,14 +329,12 @@ class SteamBot {
       const uniqueTypes = Object.keys(byClass).length;
       const knownSize   = setInfoMap[appId];
 
-      // 세트 크기 검증
       if (knownSize && knownSize > 0) {
         if (uniqueTypes < knownSize) {
           this.log(`[건너뜀] AppID ${appId}: ${uniqueTypes}종 보유 / 세트 크기 ${knownSize}종 — 카드 부족`);
           continue;
         }
       } else {
-        // data.json에 없으면 최소 3종 이상이어야 인정
         if (uniqueTypes < 3) {
           this.log(`[건너뜀] AppID ${appId}: ${uniqueTypes}종 보유 — 세트 정보 없음 & 3종 미만`);
           continue;
@@ -361,11 +342,9 @@ class SteamBot {
       }
 
       const setSize  = knownSize || uniqueTypes;
-      // 각 종류별 최솟값 = 완성 세트 수
       const minCount = Math.min(...Object.values(byClass).map(arr => arr.length));
       if (minCount === 0) { this.log(`[건너뜀] AppID ${appId}: 완성 세트 0개`); continue; }
 
-      // 종류별로 minCount장씩만 선택
       for (const itemArr of Object.values(byClass)) {
         cardsToSend.push(...itemArr.slice(0, minCount));
       }
@@ -378,13 +357,11 @@ class SteamBot {
     }
     this.log(`보낼 카드: 총 ${cardsToSend.length}장 (${summary.length}개 게임)`);
 
-    // 5. 거래 생성 및 전송 (봇이 관리자에게 카드 요청)
     return new Promise((resolve, reject) => {
       const offer = this.manager.createOffer(adminSteamId);
       if (adminTradeToken) offer.setToken(adminTradeToken);
       offer.setMessage(`[카드 쇼케이스 봇] 전체 재고보충 — ${summary.length}개 게임, ${cardsToSend.length}장 (완성 세트만)`);
 
-      // addTheirItem: 상대방(관리자)의 아이템을 요청 (관리자 → 봇)
       cardsToSend.forEach(card => {
         offer.addTheirItem({
           appid:     753,
@@ -419,7 +396,6 @@ class SteamBot {
           const count = getGemCount(item);
           totalGems  += count;
           gemItems.push({ item, count });
-          this.log(`[보석] "${item.market_hash_name}" × ${item.amount} = ${count}개`);
         }
 
         this.log(`구매자 보석 총합: ${totalGems.toLocaleString()}개 (${gemItems.length}종 아이템)`);
@@ -428,24 +404,22 @@ class SteamBot {
     });
   }
 
-  // ── 구매 거래 생성 ─────────────────────────────────────────────────────────
-  async sendPurchaseOffer(buyerSteamId, buyerTradeToken, appId, gemCount) {
+  // ── 다중 구매 거래 생성 (수량 지원 추가) ─────────────────────────────────────────
+  async sendPurchaseOffer(buyerSteamId, buyerTradeToken, appId, gemCount, quantity = 1) {
     if (!this.isLoggedIn) throw new Error('봇이 로그인되어 있지 않습니다.');
 
     const data    = loadData();
     const setInfo = data.sets.find(s => String(s.appId) === String(appId));
     if (!setInfo)        throw new Error('해당 게임 세트 정보가 없습니다.');
     if (!setInfo.listed) throw new Error('판매 중이 아닌 세트입니다.');
-    if ((setInfo.completeSets || 0) <= 0) throw new Error('재고가 없습니다.');
+    if ((setInfo.completeSets || 0) < quantity) throw new Error(`재고가 부족합니다. (요청: ${quantity}세트)`);
 
-    this.log(`구매 거래 시작: 구매자 ${buyerSteamId}, AppID ${appId}, 보석 ${gemCount}개`);
+    this.log(`구매 거래 시작: 구매자 ${buyerSteamId}, AppID ${appId}, 수량 ${quantity}세트, 보석 ${gemCount}개`);
 
     return new Promise((resolve, reject) => {
-      // 봇 인벤토리에서 해당 게임 카드 조회
       this.manager.getInventoryContents(753, 6, true, (err, botInventory) => {
         if (err) { reject(new Error(`봇 인벤토리 조회 실패: ${err.message}`)); return; }
 
-        // 해당 appId 노말 카드 필터
         const gameCards = (botInventory || []).filter(item => {
           const type = (item.type || '').toLowerCase();
           if (!type.includes('trading card') || type.includes('foil')) return false;
@@ -453,24 +427,29 @@ class SteamBot {
           return itemAppId === String(appId);
         });
 
-        if (gameCards.length === 0) {
-          reject(new Error('봇 인벤토리에 해당 게임 카드가 없습니다. 재고보충을 먼저 해주세요.'));
-          return;
-        }
-
-        // 고유 카드 1종씩 한 세트 구성
+        // 카드 종류별로 분류
         const cardsByClass = {};
         gameCards.forEach(card => {
-          if (!cardsByClass[card.classid]) cardsByClass[card.classid] = card;
+          if (!cardsByClass[card.classid]) cardsByClass[card.classid] = [];
+          cardsByClass[card.classid].push(card);
         });
-        const setCards = Object.values(cardsByClass);
-        this.log(`봇 카드 세트: ${setCards.length}종`);
 
-        // 구매자 인벤토리에서 보석 조회
+        // 필요한 수량만큼 추출
+        const setCards = [];
+        for (const classid in cardsByClass) {
+          if (cardsByClass[classid].length < quantity) {
+            reject(new Error(`봇 인벤토리에 카드가 부족합니다. (요청수량: ${quantity}세트)`));
+            return;
+          }
+          // 요청된 수량(quantity)만큼 카드를 배열에 추가
+          setCards.push(...cardsByClass[classid].slice(0, quantity));
+        }
+
+        this.log(`봇 카드 세트: ${setCards.length}장 추출 완료 (${quantity}세트)`);
+
         this.community.getUserInventoryContents(buyerSteamId, 753, 6, true, 'english', (err2, buyerItems) => {
           if (err2) { reject(new Error(`구매자 인벤토리 조회 실패: ${err2.message}`)); return; }
 
-          // 보석 아이템 수집 및 잔액 계산
           let totalBuyerGems = 0;
           const buyerGemItems = [];
           for (const item of (buyerItems || [])) {
@@ -480,19 +459,15 @@ class SteamBot {
             buyerGemItems.push({ item, count });
           }
 
-          this.log(`구매자 보석 잔액: ${totalBuyerGems.toLocaleString()}개`);
-
           if (totalBuyerGems < gemCount) {
             reject(new Error(`보석이 부족합니다. 필요: ${gemCount.toLocaleString()} 💎 / 보유: ${totalBuyerGems.toLocaleString()} 💎`));
             return;
           }
 
-          // 필요한 보석 수만큼 아이템 선택
-          // 낱개 보석 먼저, 그 다음 보석 주머니 순서로 사용
           const sortedGemItems = [...buyerGemItems].sort((a, b) => {
             const aIsSack = isSackOfGems(a.item) ? 1 : 0;
             const bIsSack = isSackOfGems(b.item) ? 1 : 0;
-            return aIsSack - bIsSack; // 낱개 먼저
+            return aIsSack - bIsSack;
           });
 
           let remaining    = gemCount;
@@ -519,14 +494,12 @@ class SteamBot {
             return;
           }
 
-          // 거래 생성: 봇 카드 → 구매자 / 구매자 보석 → 봇
           const partner32 = (BigInt(buyerSteamId) - BigInt('76561197960265728')).toString();
           const tradeUrl  = `https://steamcommunity.com/tradeoffer/new/?partner=${partner32}${buyerTradeToken ? `&token=${buyerTradeToken}` : ''}`;
           const offer     = this.manager.createOffer(tradeUrl);
           if (buyerTradeToken) offer.setToken(buyerTradeToken);
-          offer.setMessage(`[카드 쇼케이스 봇] ${setInfo.gameName} 트레이딩 카드 세트 — ${gemCount.toLocaleString()} 보석`);
+          offer.setMessage(`[카드 쇼케이스 봇] ${setInfo.gameName} 트레이딩 카드 ${quantity}세트 — ${gemCount.toLocaleString()} 보석`);
 
-          // 봇 → 구매자: 카드 세트
           setCards.forEach(card => offer.addMyItem({
             appid:     753,
             contextid: 6,
@@ -534,7 +507,6 @@ class SteamBot {
             amount:    1,
           }));
 
-          // 구매자 → 봇: 보석
           gemsToTake.forEach(gem => offer.addTheirItem(gem));
 
           this.log(`거래 생성: 카드 ${setCards.length}장, 보석 ${gemCount}개`);
@@ -544,21 +516,20 @@ class SteamBot {
             this.log(`구매 거래 전송 완료 (상태: ${status}, ID: ${offer.id})`);
             if (status === 'pending') this._confirmOffer(offer.id);
 
-            // 재고 즉시 차감
             const data2 = loadData();
             const set2  = data2.sets.find(s => String(s.appId) === String(appId));
             if (set2) {
-              set2.completeSets = Math.max(0, (set2.completeSets || 1) - 1);
+              set2.completeSets = Math.max(0, (set2.completeSets || quantity) - quantity);
               if (set2.completeSets === 0) set2.listed = false;
               saveData(data2);
-              this.log(`재고 차감: ${set2.gameName} → 잔여 ${set2.completeSets}세트`);
+              this.log(`재고 차감: ${set2.gameName} -${quantity}세트 → 잔여 ${set2.completeSets}세트`);
             }
 
             resolve({
               success: true,
               offerId: offer.id,
               status,
-              message: `${setInfo.gameName} 카드 세트 거래가 전송되었습니다! 스팀 앱에서 확인하세요.`,
+              message: `${setInfo.gameName} 카드 ${quantity}세트 거래가 전송되었습니다! 스팀 앱에서 확인하세요.`,
             });
           });
         });

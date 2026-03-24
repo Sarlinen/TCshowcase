@@ -12,7 +12,6 @@ async function request(method: string, url: string, body?: unknown) {
   return data;
 }
 
-// 로그인
 export const login = (username: string, password: string) =>
   fetch('/api/login', {
     method: 'POST',
@@ -25,37 +24,46 @@ export const login = (username: string, password: string) =>
     return d;
   });
 
-// 로그아웃
-export const logout = () =>
-  fetch('/api/logout', { method: 'POST', credentials: 'include' }).then(() => {});
-
-// 세션 상태 확인
-export const checkSession = () =>
-  fetch('/api/session', { credentials: 'include' })
-    .then(r => r.json())
-    .then(d => d.isAdmin === true);
+export const logout = () => fetch('/api/logout', { method: 'POST', credentials: 'include' }).then(() => {});
+export const checkSession = () => fetch('/api/session', { credentials: 'include' }).then(r => r.json()).then(d => d.isAdmin === true);
 
 export const getConfig  = ()                => request('GET',  '/api/config');
 export const saveConfig = (config: unknown) => request('POST', '/api/config', config);
 export const getData    = ()                => request('GET',  '/api/data');
 export const saveData   = (data: unknown)   => request('POST', '/api/data', data);
-
 export const refreshSteam     = ()                       => request('POST', '/api/steam/refresh');
 export const fetchPriceForSet = (appId: string | number) => request('POST', `/api/steam/price/${appId}`);
 export const fetchLvlupForSet = (appId: string | number) => request('POST', `/api/steam/lvlup/${appId}`);
 export const fetchLvlupAll    = ()                       => request('POST', '/api/steam/lvlup-all');
-
-// 봇 API
 export const getBotStatus = () => request('GET',  '/api/bot/status');
 export const loginBot     = () => request('POST', '/api/bot/login');
 export const restockBot   = (body?: Record<string, unknown>) => request('POST', '/api/bot/restock', body || {});
 
-// 공개 상점 API
-export const getShop = () =>
-  fetch('/api/shop', { credentials: 'include' }).then(r => r.json());
+export interface Coupon {
+  code: string; discountRate: number; minPurchase: number; maxDiscount: number; usageLimit: number; usedCount: number;
+}
+export const getCoupons   = () => request('GET', '/api/coupons');
+export const createCoupon = (data: Partial<Coupon>) => request('POST', '/api/coupons', data);
+export const deleteCoupon = (code: string) => request('DELETE', `/api/coupons/${code}`);
 
-// 구매 거래 생성 — tradeUrl (트레이드 URL 전체) + appId
-export const createPurchase = (body: { tradeUrl: string; appId: string | number }) =>
+export interface SteamUser {
+  steamId: string;
+  displayName?: string;
+  avatar?: string;
+  approved: boolean;
+  joinedAt: string;
+}
+export const getUsers    = () => request('GET', '/api/users');
+export const approveUser = (steamId: string) => request('POST', `/api/users/${steamId}/approve`);
+export const deleteUser  = (steamId: string) => request('DELETE', `/api/users/${steamId}`);
+
+export const getMe = () => fetch('/api/auth/me', { credentials: 'include' }).then(r => r.json());
+export const logoutSteam = () => request('POST', '/api/auth/steam/logout');
+
+export const getShop = () => fetch('/api/shop', { credentials: 'include' }).then(r => r.json());
+export const validateCoupon = (code: string, price: number) => request('POST', '/api/shop/validate-coupon', { code, price });
+
+export const createPurchase = (body: { tradeUrl: string; appId: string | number; couponCode?: string; quantity?: number }) =>
   fetch('/api/shop/purchase', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
