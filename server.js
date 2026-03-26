@@ -5,12 +5,13 @@ const session = require('express-session');
 const fs      = require('fs');
 const path    = require('path');
 const axios   = require('axios');
-const cheerio = require('cheerio');
+const AdmZip  = require('adm-zip'); 
 const bot     = require('./bot');
 
 const app = express();
 app.set('trust proxy', true);
 app.use(express.json({ limit: '50mb' }));
+
 app.use(session({
   secret: 'steam-card-shop-secret-2024',
   resave: false,
@@ -27,12 +28,16 @@ const DEFAULT_CONFIG = {
   steamLoginSecure: '', gemSackPrice: 1100,
   lvlupPointToGem: 5, lvlupBuyMultiplier: 1.0,
   adminPassword: 'admin1234', adminSteamId: '', adminTradeToken: '',
+  novelAiKey: '', energyEarnRate: 5, novelAiCost: 100,
+  novelAiUrl: 'https://image.novelai.net/ai/generate-image',
+  novelAiModelCurated: 'nai-diffusion-4-5-curated',
+  novelAiModelFull: 'nai-diffusion-4-5-full'
 };
 
 const DEFAULT_DATA = { sets: [], coupons: [], users: [] };
 
 function readJSON(fp, def) {
-  try { if (fs.existsSync(fp)) return JSON.parse(fs.readFileSync(fp, 'utf-8')); } catch {}
+  try { if (fs.existsSync(fp)) return JSON.parse(fs.readFileSync(fp, 'utf-8')); } catch (e) {}
   return { ...def };
 }
 function writeJSON(fp, d) { fs.writeFileSync(fp, JSON.stringify(d, null, 2), 'utf-8'); }
@@ -43,6 +48,8 @@ function authMiddleware(req, res, next) {
   return res.status(401).json({ error: '로그인이 필요합니다.' });
 }
 
+// ── 인증 API ──
+app.get('/api/session', (req, res) => res.json({ isAdmin: !!(req.session && req.session.isAdmin) }));
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG);
@@ -50,29 +57,18 @@ app.post('/api/login', (req, res) => {
     req.session.isAdmin = true;
     return res.json({ success: true });
   }
-  return res.status(401).json({ error: '아이디 또는 비밀번호가 틀립니다.' });
+  return res.status(401).json({ error: '인증 실패' });
 });
+app.post('/api/logout', (req, res) => { req.session.destroy(); res.json({ success: true }); });
 
-app.post('/api/logout', (req, res) => {
-  req.session.destroy();
-  res.json({ success: true });
-});
-
-app.get('/api/session', (req, res) => {
-  res.json({ isAdmin: !!(req.session && req.session.isAdmin) });
-});
-
-// ── Steam OpenID ────────────────────────────────────────────────
+// ── 스팀 OpenID 인증 ──
 app.get('/api/auth/steam', (req, res) => {
   const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-  const host = req.headers.host;
-  const realm = `${protocol}://${host}`;
-  const returnUrl = `${realm}/api/auth/steam/return`;
-
+  const realm = `${protocol}://${req.headers.host}`;
   const params = new URLSearchParams({
     'openid.ns': 'http://specs.openid.net/auth/2.0',
     'openid.mode': 'checkid_setup',
-    'openid.return_to': returnUrl,
+    'openid.return_to': `${realm}/api/auth/steam/return`,
     'openid.realm': realm,
     'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
     'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select'
@@ -81,135 +77,186 @@ app.get('/api/auth/steam', (req, res) => {
 });
 
 app.get('/api/auth/steam/return', async (req, res) => {
-  const params = new URLSearchParams(req.query);
-  params.set('openid.mode', 'check_authentication');
   try {
-    const verifyRes = await axios.post('https://steamcommunity.com/openid/login', params.toString(), {
+    const rawQuery = req.originalUrl.split('?')[1];
+    if (!rawQuery) return res.status(400).send('잘못된 요청입니다.');
+
+    const verifyStr = rawQuery.replace('openid.mode=id_res', 'openid.mode=check_authentication');
+
+    const verifyRes = await axios.post('https://steamcommunity.com/openid/login', verifyStr, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
-    
+
     if (verifyRes.data.includes('is_valid:true')) {
       const claimedId = req.query['openid.claimed_id'];
+      if (!claimedId) return res.status(400).send('Steam ID가 누락되었습니다.');
+
       const steamId = claimedId.split('/').pop();
+      let displayName = steamId, avatar = '';
       
-      // 프로필 이름 및 아바타 가져오기
-      let displayName = steamId;
-      let avatar = '';
       try {
         const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG);
         if (config.steamApiKey) {
           const sumRes = await axios.get(`https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=${config.steamApiKey}&steamids=${steamId}`);
-          const player = sumRes.data.response.players[0];
-          if (player) {
-            displayName = player.personaname;
-            avatar = player.avatar;
-          }
+          const p = sumRes.data.response.players[0];
+          if (p) { displayName = p.personaname; avatar = p.avatar; }
         } else {
-          // API Key가 없을 경우 XML 스크래핑
           const xmlRes = await axios.get(`https://steamcommunity.com/profiles/${steamId}?xml=1`, { timeout: 5000 });
           const match = xmlRes.data.match(/<steamID><!\[CDATA\[(.*?)\]\]><\/steamID>/);
           if (match) displayName = match[1];
           const avMatch = xmlRes.data.match(/<avatarIcon><!\[CDATA\[(.*?)\]\]><\/avatarIcon>/);
           if (avMatch) avatar = avMatch[1];
         }
-      } catch (e) {
-        console.warn('Profile fetch error:', e.message);
-      }
-      
+      } catch (e) { console.error('[Steam Profile Fetch Error]', e.message); }
+
       const data = readJSON(DATA_PATH, DEFAULT_DATA);
       if (!data.users) data.users = [];
       
       let user = data.users.find(u => u.steamId === steamId);
       if (!user) {
-        user = { steamId, displayName, avatar, approved: false, joinedAt: new Date().toISOString() };
+        user = { steamId, displayName, avatar, approved: false, energy: 0, joinedAt: new Date().toISOString() };
         data.users.push(user);
       } else {
-        user.displayName = displayName;
+        user.displayName = displayName; 
         user.avatar = avatar;
+        if (user.energy === undefined) user.energy = 0;
       }
+      
       writeJSON(DATA_PATH, data);
-
       req.session.steamUser = user;
-      res.redirect('/');
-    } else {
-      res.status(401).send('Steam OpenID 인증에 실패했습니다.');
+      
+      req.session.save(() => res.redirect('/'));
+    } else { 
+      console.error('[Steam OpenID Invalid]', verifyRes.data);
+      res.status(401).send('스팀 인증이 거부되었습니다. (is_valid:false)'); 
     }
-  } catch (err) {
-    res.status(500).send('OpenID 통신 중 오류가 발생했습니다.');
+  } catch (err) { 
+    console.error('[Steam Auth 통신 오류]', err.message);
+    res.status(500).send('스팀 서버 통신 오류'); 
   }
 });
 
 app.get('/api/auth/me', (req, res) => {
   if (!req.session.steamUser) return res.json(null);
   const data = readJSON(DATA_PATH, DEFAULT_DATA);
-  const currentUser = (data.users || []).find(u => u.steamId === req.session.steamUser.steamId);
-  res.json(currentUser || null);
+  if (!data.users) data.users = [];
+  res.json(data.users.find(u => u.steamId === req.session.steamUser.steamId) || null);
 });
+app.post('/api/auth/steam/logout', (req, res) => { req.session.steamUser = null; res.json({ success: true }); });
 
-app.post('/api/auth/steam/logout', (req, res) => {
-  req.session.steamUser = null;
-  res.json({ success: true });
-});
+// ── 에너지 쿠폰 ──
+app.post('/api/users/energy-coupon', async (req, res) => {
+  try {
+    if (!req.session.steamUser) return res.status(401).json({ error: '로그인 필요' });
+    const { code } = req.body;
+    const data = readJSON(DATA_PATH, DEFAULT_DATA);
+    if (!data.coupons) data.coupons = [];
+    if (!data.users) data.users = [];
+    
+    const cIdx = data.coupons.findIndex(c => c.code === code.toUpperCase() && c.type === 'energy');
+    if (cIdx < 0) return res.status(404).json({ error: '유효하지 않은 쿠폰' });
+    const user = data.users.find(u => u.steamId === req.session.steamUser.steamId);
+    if (!user) return res.status(404).json({ error: '유저 데이터 없음' });
 
-// ── 유저 관리 API ─────────────────────────────────────────────────────────────
-app.get('/api/users', authMiddleware, (req, res) => {
-  const data = readJSON(DATA_PATH, DEFAULT_DATA);
-  res.json({ users: data.users || [] });
-});
-
-app.post('/api/users/:steamId/approve', authMiddleware, (req, res) => {
-  const data = readJSON(DATA_PATH, DEFAULT_DATA);
-  const user = (data.users || []).find(u => u.steamId === req.params.steamId);
-  if (user) {
-    user.approved = true;
+    user.energy = (user.energy || 0) + (data.coupons[cIdx].energyAmount || 0);
+    data.coupons[cIdx].usedCount += 1;
+    if (data.coupons[cIdx].usedCount >= data.coupons[cIdx].usageLimit) data.coupons.splice(cIdx, 1);
+    
     writeJSON(DATA_PATH, data);
+    res.json({ success: true, totalEnergy: user.energy });
+  } catch (err) { res.status(500).json({ error: '오류' }); }
+});
+
+// ── NovelAI 작업 대기열 (Queue) ──
+const aiQueue = [];
+const aiJobs = {};
+let isAiProcessing = false;
+
+app.post('/api/ai/generate/submit', async (req, res) => {
+  try {
+    if (!req.session.steamUser) return res.status(401).json({ error: '로그인 필요' });
+    const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG);
+    const data = readJSON(DATA_PATH, DEFAULT_DATA);
+    if (!data.users) data.users = [];
+
+    const user = data.users.find(u => u.steamId === req.session.steamUser.steamId);
+    if (!user || !user.approved) return res.status(403).json({ error: '승인 필요' });
+    if (config.novelAiCost > 0 && (user.energy || 0) < config.novelAiCost) return res.status(400).json({ error: 'Energy 부족' });
+
+    const jobId = Date.now().toString() + Math.random().toString(36).substring(7);
+    aiJobs[jobId] = { steamId: user.steamId, reqBody: req.body, status: 'queued' };
+    aiQueue.push(jobId);
+    processAiQueue();
+    res.json({ success: true, jobId });
+  } catch (err) { res.status(500).json({ error: '등록 실패' }); }
+});
+
+app.get('/api/ai/generate/status/:jobId', (req, res) => {
+  const job = aiJobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: '작업 없음' });
+  const pos = aiQueue.indexOf(req.params.jobId);
+  res.json({ status: job.status, position: pos >= 0 ? pos : 0, result: job.result, error: job.error });
+  if (job.status === 'done' || job.status === 'error') setTimeout(() => { delete aiJobs[req.params.jobId]; }, 60000);
+});
+
+async function processAiQueue() {
+  if (isAiProcessing) return;
+  isAiProcessing = true;
+  while (aiQueue.length > 0) {
+    const jobId = aiQueue[0];
+    const job = aiJobs[jobId];
+    if (!job) { aiQueue.shift(); continue; }
+    job.status = 'processing';
+    try {
+      const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG);
+      const data = readJSON(DATA_PATH, DEFAULT_DATA);
+      if (!data.users) data.users = [];
+      const user = data.users.find(u => u.steamId === job.steamId);
+      const { basePrompt, charPrompt, negativePrompt, charNegativePrompt, model } = job.reqBody;
+
+      const finalInput = ["very aesthetic, masterpiece, no text", basePrompt, charPrompt].filter(Boolean).join(", ");
+      const finalNegative = ["nsfw, lowres, artistic error, worst quality, bad quality", negativePrompt, charNegativePrompt].filter(Boolean).join(", ");
+      const targetModel = model === 'curated' ? config.novelAiModelCurated : config.novelAiModelFull;
+
+      const payload = {
+        action: "generate", input: finalInput, model: targetModel,
+        parameters: {
+          params_version: 3, width: 832, height: 1216, scale: 5, sampler: "k_euler_ancestral", steps: 28, n_samples: 1, ucPreset: 0,
+          qualityToggle: true, noise_schedule: "karras", seed: Math.floor(Math.random() * 4294967295), negative_prompt: finalNegative,
+          v4_prompt: { caption: { base_caption: finalInput, char_captions: charPrompt ? [{ char_caption: charPrompt, centers: [{x:0, y:0}] }] : [] }, use_coords: true, use_order: true },
+          v4_negative_prompt: { caption: { base_caption: finalNegative, char_captions: [] }, legacy_uc: false }
+        }
+      };
+
+      const aiRes = await axios.post(config.novelAiUrl, payload, {
+        headers: { 'Authorization': `Bearer ${config.novelAiKey.trim()}`, 'Content-Type': 'application/json' },
+        responseType: 'arraybuffer'
+      });
+
+      const buffer = Buffer.from(aiRes.data);
+      let base64Image = '';
+      if (buffer[0] === 0x89 && buffer[1] === 0x50) base64Image = `data:image/png;base64,${buffer.toString('base64')}`;
+      else {
+        const zip = new AdmZip(buffer);
+        const entry = zip.getEntries().find(e => e.entryName.endsWith('.png'));
+        base64Image = `data:image/png;base64,${entry.getData().toString('base64')}`;
+      }
+
+      if (config.novelAiCost > 0 && user) { user.energy -= config.novelAiCost; writeJSON(DATA_PATH, data); }
+      job.result = { image: base64Image, remainingEnergy: user ? user.energy : 0 };
+      job.status = 'done';
+    } catch (err) { job.error = err.message; job.status = 'error'; }
+    aiQueue.shift();
+    if (aiQueue.length > 0) await delay(5000);
   }
-  res.json({ success: true });
-});
+  isAiProcessing = false;
+}
 
-app.delete('/api/users/:steamId', authMiddleware, (req, res) => {
-  const data = readJSON(DATA_PATH, DEFAULT_DATA);
-  data.users = (data.users || []).filter(u => u.steamId !== req.params.steamId);
-  writeJSON(DATA_PATH, data);
-  res.json({ success: true });
-});
-
-// ── 기존 API들 ────────────────────────────────────────────────────────
-app.get('/api/config', authMiddleware, (req, res) => res.json(readJSON(CONFIG_PATH, DEFAULT_CONFIG)));
-app.post('/api/config', authMiddleware, (req, res) => { writeJSON(CONFIG_PATH, req.body); res.json({ success: true }); });
-app.get('/api/data', authMiddleware, (req, res) => res.json(readJSON(DATA_PATH, DEFAULT_DATA)));
-app.post('/api/data', authMiddleware, (req, res) => { writeJSON(DATA_PATH, req.body); res.json({ success: true }); });
-app.get('/api/shop', (req, res) => { const data = readJSON(DATA_PATH, DEFAULT_DATA); const sets = (data.sets || []).filter(s => s.listed && s.sellPrice > 0 && s.completeSets > 0); res.json({ sets }); });
-
-app.get('/api/coupons', authMiddleware, (req, res) => { const data = readJSON(DATA_PATH, DEFAULT_DATA); res.json({ coupons: data.coupons || [] }); });
-app.post('/api/coupons', authMiddleware, (req, res) => {
-  const { code, discountRate, minPurchase, maxDiscount, usageLimit } = req.body;
-  if (!code) return res.status(400).json({ error: '쿠폰 코드가 필요합니다.' });
-  const data = readJSON(DATA_PATH, DEFAULT_DATA); if (!data.coupons) data.coupons = [];
-  const existingIdx = data.coupons.findIndex(c => c.code === code.toUpperCase());
-  const couponObj = { code: code.toUpperCase(), discountRate: Number(discountRate) || 0, minPurchase: Number(minPurchase) || 0, maxDiscount: Number(maxDiscount) || 0, usageLimit: Number(usageLimit) || 1, usedCount: existingIdx >= 0 ? data.coupons[existingIdx].usedCount : 0 };
-  if (existingIdx >= 0) data.coupons[existingIdx] = couponObj; else data.coupons.push(couponObj);
-  writeJSON(DATA_PATH, data); res.json({ success: true, coupon: couponObj });
-});
-app.delete('/api/coupons/:code', authMiddleware, (req, res) => {
-  const data = readJSON(DATA_PATH, DEFAULT_DATA); if (!data.coupons) data.coupons = [];
-  data.coupons = data.coupons.filter(c => c.code !== req.params.code.toUpperCase()); writeJSON(DATA_PATH, data); res.json({ success: true });
-});
-app.post('/api/shop/validate-coupon', (req, res) => {
-  const { code, price } = req.body; const data = readJSON(DATA_PATH, DEFAULT_DATA);
-  const coupon = (data.coupons || []).find(c => c.code === (code || '').toUpperCase());
-  if (!coupon) return res.status(404).json({ error: '존재하지 않는 쿠폰입니다.' });
-  if (coupon.usedCount >= coupon.usageLimit) return res.status(400).json({ error: '사용 횟수가 모두 소진된 쿠폰입니다.' });
-  if (price < coupon.minPurchase) return res.status(400).json({ error: `최소 ${coupon.minPurchase} 보석 이상 구매 시 사용 가능합니다.` });
-  let discount = Math.floor(price * (coupon.discountRate / 100));
-  if (coupon.maxDiscount > 0) discount = Math.min(discount, coupon.maxDiscount);
-  res.json({ success: true, discount, finalPrice: price - discount, coupon });
-});
-
-const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8' };
-async function fetchViaOldJson(steamId, cookie) { /*...*/ const url = `https://steamcommunity.com/profiles/${steamId}/inventory/json/753/6`; const headers = { ...HEADERS, Referer: `https://steamcommunity.com/profiles/${steamId}/inventory` }; if (cookie) headers.Cookie = `steamLoginSecure=${cookie}`; const resp = await axios.get(url, { headers, timeout: 30000, params: { l: 'english', count: 5000 } }); const d = resp.data; if (!d.success) throw new Error('success=false'); const rgInv = d.rgInventory || {}; const rgDesc = d.rgDescriptions || {}; const items = []; for (const id in rgInv) { const inv = rgInv[id]; const desc = rgDesc[`${inv.classid}_${inv.instanceid}`]; if (desc) items.push({ asset: { assetid: id, classid: inv.classid, instanceid: inv.instanceid, amount: inv.amount || '1' }, desc }); } return items; }
-async function fetchViaNewApi(steamId, cookie) { /*...*/ const allAssets = [], allDescs = {}; let lastAssetId = null, page = 0; while (true) { page++; const params = { l: 'english', count: 2000 }; if (lastAssetId) params.start_assetid = lastAssetId; const headers = { ...HEADERS, Referer: `https://steamcommunity.com/profiles/${steamId}/inventory`, 'X-Requested-With': 'XMLHttpRequest' }; if (cookie) headers.Cookie = `steamLoginSecure=${cookie}`; const resp = await axios.get(`https://steamcommunity.com/inventory/${steamId}/753/6`, { params, headers, timeout: 30000 }); const d = resp.data; if (!d || d.success !== 1) throw new Error(`success=${d && d.success}`); const assets = d.assets || [], descs = d.descriptions || []; if (assets.length === 0 && d.total_inventory_count > 0) throw new Error('assets 비어있음'); for (const desc of descs) allDescs[`${desc.classid}_${desc.instanceid}`] = desc; for (const a of assets) allAssets.push(a); if (!d.more_items || assets.length === 0) break; lastAssetId = d.last_assetid; await delay(500); } return allAssets.map(a => ({ asset: a, desc: allDescs[`${a.classid}_${a.instanceid}`] })).filter(i => i.desc); }
-async function fetchViaWebApi(steamId, apiKey) { /*...*/ if (!apiKey) throw new Error('API Key 없음'); const allAssets = [], allDescs = {}; let startAssetId = null, page = 0; while (true) { page++; const params = { key: apiKey, steamid: steamId, appid: 753, contextid: 6, count: 2000, get_descriptions: 1 }; if (startAssetId) params.start_assetid = startAssetId; const resp = await axios.get('https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/', { params, timeout: 30000 }); const r = resp.data.response || resp.data; const assets = r.assets || [], descs = r.descriptions || []; if (assets.length === 0 && page === 1) throw new Error('assets 비어있음'); for (const desc of descs) allDescs[`${desc.classid}_${desc.instanceid}`] = desc; for (const a of assets) allAssets.push(a); if (!r.more_items || assets.length === 0) break; startAssetId = r.last_assetid || (assets[assets.length - 1] && assets[assets.length - 1].assetid); await delay(500); } return allAssets.map(a => ({ asset: a, desc: allDescs[`${a.classid}_${a.instanceid}`] })).filter(i => i.desc); }
+// ── 상점, 세트 동기화, 거래 추적 ──
+const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8' };
+async function fetchViaOldJson(steamId, cookie) { const url = `https://steamcommunity.com/profiles/${steamId}/inventory/json/753/6`; const headers = { ...HEADERS, Referer: `https://steamcommunity.com/profiles/${steamId}/inventory` }; if (cookie) headers.Cookie = `steamLoginSecure=${cookie}`; const resp = await axios.get(url, { headers, timeout: 30000, params: { l: 'english', count: 5000 } }); const d = resp.data; if (!d.success) throw new Error('success=false'); const rgInv = d.rgInventory || {}; const rgDesc = d.rgDescriptions || {}; const items = []; for (const id in rgInv) { const inv = rgInv[id]; const desc = rgDesc[`${inv.classid}_${inv.instanceid}`]; if (desc) items.push({ asset: { assetid: id, classid: inv.classid, instanceid: inv.instanceid, amount: inv.amount || '1' }, desc }); } return items; }
+async function fetchViaNewApi(steamId, cookie) { const allAssets = [], allDescs = {}; let lastAssetId = null, page = 0; while (true) { page++; const params = { l: 'english', count: 2000 }; if (lastAssetId) params.start_assetid = lastAssetId; const headers = { ...HEADERS, Referer: `https://steamcommunity.com/profiles/${steamId}/inventory`, 'X-Requested-With': 'XMLHttpRequest' }; if (cookie) headers.Cookie = `steamLoginSecure=${cookie}`; const resp = await axios.get(`https://steamcommunity.com/inventory/${steamId}/753/6`, { params, headers, timeout: 30000 }); const d = resp.data; if (!d || d.success !== 1) throw new Error(`success=${d && d.success}`); const assets = d.assets || [], descs = d.descriptions || []; if (assets.length === 0 && d.total_inventory_count > 0) throw new Error('assets 비어있음'); for (const desc of descs) allDescs[`${desc.classid}_${desc.instanceid}`] = desc; for (const a of assets) allAssets.push(a); if (!d.more_items || assets.length === 0) break; lastAssetId = d.last_assetid; await delay(500); } return allAssets.map(a => ({ asset: a, desc: allDescs[`${a.classid}_${a.instanceid}`] })).filter(i => i.desc); }
+async function fetchViaWebApi(steamId, apiKey) { if (!apiKey) throw new Error('API Key 없음'); const allAssets = [], allDescs = {}; let startAssetId = null, page = 0; while (true) { page++; const params = { key: apiKey, steamid: steamId, appid: 753, contextid: 6, count: 2000, get_descriptions: 1 }; if (startAssetId) params.start_assetid = startAssetId; const resp = await axios.get('https://api.steampowered.com/IEconService/GetInventoryItemsWithDescriptions/v1/', { params, timeout: 30000 }); const r = resp.data.response || resp.data; const assets = r.assets || [], descs = r.descriptions || []; if (assets.length === 0 && page === 1) throw new Error('assets 비어있음'); for (const desc of descs) allDescs[`${desc.classid}_${desc.instanceid}`] = desc; for (const a of assets) allAssets.push(a); if (!r.more_items || assets.length === 0) break; startAssetId = r.last_assetid || (assets[assets.length - 1] && assets[assets.length - 1].assetid); await delay(500); } return allAssets.map(a => ({ asset: a, desc: allDescs[`${a.classid}_${a.instanceid}`] })).filter(i => i.desc); }
 async function fetchInventory(steamId, apiKey, cookie) { const errors = []; for (const [name, fn] of [['방법A', () => fetchViaOldJson(steamId, cookie)], ['방법B', () => fetchViaNewApi(steamId, cookie)], ['방법C', () => fetchViaWebApi(steamId, apiKey)]]) { try { const items = await fn(); if (items.length > 0) return items; } catch (e) { errors.push(e.message); } } throw new Error('모든 방법 실패:\n' + errors.join('\n')); }
 function isTradingCard(desc) { if (desc.type) { const t = desc.type.toLowerCase(); if (t.includes('trading card')) return true; } const tags = desc.tags || []; if (tags.some(t => t.internal_name === 'item_class_2')) return true; if (tags.some(t => (t.localized_tag_name || t.name || '').toLowerCase().includes('trading card'))) return true; return false; }
 function isFoilCard(desc) { if (desc.type && desc.type.toLowerCase().includes('foil')) return true; return (desc.tags || []).some(t => t.internal_name === 'cardborder_1'); }
@@ -222,7 +269,8 @@ function calcLvlupSuggestedGem(pts, pointToGem, multiplier) { if (!pts || pts <=
 app.post('/api/steam/refresh', authMiddleware, async (req, res) => {
   try {
     const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG); const existingData = readJSON(DATA_PATH, DEFAULT_DATA);
-    const steamId = config.steamId; if (!steamId) return res.status(400).json({ error: '스팀 커뮤니티 ID가 설정되지 않았습니다.' });
+    if (!existingData.sets) existingData.sets = [];
+    const steamId = config.steamId; if (!steamId) return res.status(400).json({ error: '스팀 커뮤니티 ID 설정 필요' });
     const allItems = await fetchInventory(steamId, config.steamApiKey, config.steamLoginSecure);
     const tradingCards = [];
     for (const item of allItems) {
@@ -256,15 +304,15 @@ app.post('/api/steam/refresh', authMiddleware, async (req, res) => {
       return { ...ns, totalMarketPrice: ex.totalMarketPrice || 0, lvlupNormalPrice: ex.lvlupNormalPrice || 0, lvlupFoilPrice: ex.lvlupFoilPrice || 0, lvlupNormalStock: ex.lvlupNormalStock || 0, lvlupFoilStock: ex.lvlupFoilStock || 0, lvlupCostPoints: ex.lvlupCostPoints || 0, suggestedGemPrice: ex.suggestedGemPrice || 0, sellPrice: ex.sellPrice || 0, listed: ex.listed || false, cards: ns.cards.map(nc => { const ec = (ex.cards || []).find(c => c.marketHashName === nc.marketHashName); return ec ? { ...nc, marketPrice: ec.marketPrice || 0 } : nc; }) };
     });
     const newData = { sets: mergedSets, coupons: existingData.coupons || [], users: existingData.users || [], lastRefresh: new Date().toISOString() };
-    writeJSON(DATA_PATH, newData);
-    res.json({ success: true, data: newData });
+    writeJSON(DATA_PATH, newData); res.json({ success: true, data: newData });
   } catch (err) { res.status(500).json({ error: err.message || '새로고침 실패' }); }
 });
 
 app.post('/api/steam/price/:appId', authMiddleware, async (req, res) => {
   try {
     const appId = parseInt(req.params.appId); const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG); const data = readJSON(DATA_PATH, DEFAULT_DATA);
-    const set = (data.sets || []).find(s => s.appId === appId); if (!set) return res.status(404).json({ error: '세트를 찾을 수 없습니다.' });
+    if (!data.sets) data.sets = [];
+    const set = data.sets.find(s => s.appId === appId); if (!set) return res.status(404).json({ error: '세트 없음' });
     let totalMarketPrice = 0;
     for (let i = 0; i < set.cards.length; i++) {
       const card = set.cards[i]; if (!card.marketHashName) continue;
@@ -280,7 +328,8 @@ app.post('/api/steam/price/:appId', authMiddleware, async (req, res) => {
 app.post('/api/steam/lvlup/:appId', authMiddleware, async (req, res) => {
   try {
     const appId = parseInt(req.params.appId); const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG); const data = readJSON(DATA_PATH, DEFAULT_DATA);
-    const set = (data.sets || []).find(s => s.appId === appId); if (!set) return res.status(404).json({ error: '세트를 찾을 수 없습니다.' });
+    if (!data.sets) data.sets = [];
+    const set = data.sets.find(s => s.appId === appId); if (!set) return res.status(404).json({ error: '세트 없음' });
     const result = await fetchLvlupPrice(appId);
     set.lvlupNormalPrice = result.normalPrice; set.lvlupFoilPrice = result.foilPrice; set.lvlupNormalStock = result.normalStock; set.lvlupFoilStock = result.foilStock; set.suggestedGemPrice = calcLvlupSuggestedGem(result.normalPrice, config.lvlupPointToGem || 5, config.lvlupBuyMultiplier || 1.0); set.lvlupCostPoints = result.normalPrice;
     writeJSON(DATA_PATH, data); res.json({ success: true, set: { appId, lvlupNormalPrice: result.normalPrice, lvlupFoilPrice: result.foilPrice, lvlupNormalStock: result.normalStock, lvlupFoilStock: result.foilStock, suggestedGemPrice: set.suggestedGemPrice, lvlupCostPoints: result.normalPrice } });
@@ -289,8 +338,10 @@ app.post('/api/steam/lvlup/:appId', authMiddleware, async (req, res) => {
 
 app.post('/api/steam/lvlup-all', authMiddleware, async (req, res) => {
   try {
-    const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG); const data = readJSON(DATA_PATH, DEFAULT_DATA); const sets = data.sets || [];
-    if (sets.length === 0) return res.status(400).json({ error: '먼저 세트 새로고침을 해주세요.' });
+    const config = readJSON(CONFIG_PATH, DEFAULT_CONFIG); const data = readJSON(DATA_PATH, DEFAULT_DATA); 
+    if (!data.sets) data.sets = [];
+    const sets = data.sets;
+    if (sets.length === 0) return res.status(400).json({ error: '새로고침 필요' });
     let success = 0, failed = 0;
     for (let i = 0; i < sets.length; i++) {
       const set = sets[i];
@@ -301,105 +352,113 @@ app.post('/api/steam/lvlup-all', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/bot/status', authMiddleware, (req, res) => res.json(bot.getStatus()));
-app.post('/api/bot/login', authMiddleware, async (req, res) => { try { const result = await bot.login(); res.json({ success: true, ...result }); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.post('/api/bot/logoff', authMiddleware, (req, res) => { bot.logoff(); res.json({ success: true }); });
-app.post('/api/bot/restock', authMiddleware, async (req, res) => { try { const result = await bot.sendRestockOfferAll(); res.json({ success: true, ...result }); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.get('/api/shop/offer-status/:offerId', async (req, res) => {
+  try {
+    const status = await bot.getOfferStatus(req.params.offerId);
+    res.json(status);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-// ── 구매 라우터 ────────────────────────────────────────────────────────
 app.post('/api/shop/purchase', async (req, res) => {
   try {
-    if (!req.session.steamUser) {
-      return res.status(401).json({ error: 'Steam 로그인이 필요합니다.' });
-    }
-
+    if (!req.session.steamUser) return res.status(401).json({ error: '로그인 필요' });
     const data = readJSON(DATA_PATH, DEFAULT_DATA);
-    const currentUser = (data.users || []).find(u => u.steamId === req.session.steamUser.steamId);
-    if (!currentUser || !currentUser.approved) {
-      return res.status(403).json({ error: '관리자의 승인이 필요한 계정입니다.' });
-    }
+    if (!data.sets) data.sets = [];
+    if (!data.coupons) data.coupons = [];
+    if (!data.users) data.users = [];
 
-    const { tradeUrl, appId, couponCode } = req.body;
-    const quantity = parseInt(req.body.quantity) || 1; 
+    const user = data.users.find(u => u.steamId === req.session.steamUser.steamId);
+    if (!user) return res.status(404).json({ error: '유저 데이터 없음' });
+    if (!user.approved) return res.status(403).json({ error: '관리자 승인이 필요합니다.' });
 
-    if (!tradeUrl || !appId) return res.status(400).json({ error: 'tradeUrl과 appId가 필요합니다.' });
-    if (quantity < 1 || quantity > 5) return res.status(400).json({ error: '구매 수량은 1~5세트 사이여야 합니다.' });
+    const { tradeUrl, appId, couponCode, quantity } = req.body;
+    const set = data.sets.find(s => String(s.appId) === String(appId));
+    if (!set || !set.listed) return res.status(404).json({ error: '상품 없음' });
 
-    let partner = '', token = '';
-    try {
-      const u = new URL(tradeUrl);
-      partner = u.searchParams.get('partner') || '';
-      token   = u.searchParams.get('token')   || '';
-    } catch {
-      return res.status(400).json({ error: '올바른 트레이드 URL 형식이 아닙니다.' });
-    }
-    if (!partner) return res.status(400).json({ error: '트레이드 URL에서 partner를 찾을 수 없습니다.' });
-
-    const buyerSteamId = (BigInt(partner) + BigInt('76561197960265728')).toString();
-
-    if (buyerSteamId !== currentUser.steamId) {
-      return res.status(403).json({ error: '본인 계정의 Trade URL만 사용할 수 있습니다.' });
-    }
-
-    const set  = (data.sets || []).find(s => String(s.appId) === String(appId));
-    if (!set)          return res.status(404).json({ error: '세트를 찾을 수 없습니다.' });
-    if (!set.listed || !set.sellPrice || set.sellPrice <= 0) return res.status(400).json({ error: '현재 판매 중이 아닙니다.' });
-    if ((set.completeSets || 0) < quantity) return res.status(400).json({ error: `재고가 부족합니다. (현재 재고: ${set.completeSets}세트)` });
-
-    let originalPrice = set.sellPrice * quantity;
-    let finalPrice = originalPrice;
-    let appliedCoupon = null;
-
+    let finalPrice = set.sellPrice * (quantity || 1);
     if (couponCode) {
-      const coupon = (data.coupons || []).find(c => c.code === couponCode.toUpperCase());
-      if (!coupon) return res.status(400).json({ error: '유효하지 않는 쿠폰 코드입니다.' });
-      if (coupon.usedCount >= coupon.usageLimit) return res.status(400).json({ error: '사용 횟수가 소진된 쿠폰입니다.' });
-      if (finalPrice < coupon.minPurchase) return res.status(400).json({ error: `최소 ${coupon.minPurchase} 보석 이상 구매 시 사용 가능합니다.` });
-
-      let discount = Math.floor(finalPrice * (coupon.discountRate / 100));
-      if (coupon.maxDiscount > 0) discount = Math.min(discount, coupon.maxDiscount);
-      
-      finalPrice -= discount;
-      appliedCoupon = coupon;
-    }
-
-    let gemBalance = 0;
-    try {
-      const balRes = await bot.getBuyerGemBalance(buyerSteamId);
-      gemBalance = balRes.gemBalance || 0;
-    } catch (e) {
-      console.warn('[구매] 보석 잔액 조회 실패:', e.message);
-    }
-    
-    if (gemBalance < finalPrice) {
-      return res.status(400).json({
-        error: `보석이 부족합니다. 필요: ${finalPrice.toLocaleString()} 💎 / 보유: ${gemBalance.toLocaleString()} 💎`,
-        gemBalance,
-        required: finalPrice,
-      });
-    }
-
-    const result = await bot.sendPurchaseOffer(buyerSteamId, token, appId, finalPrice, quantity);
-    
-    if (result.success && appliedCoupon) {
-      const freshData = readJSON(DATA_PATH, DEFAULT_DATA);
-      const cIdx = (freshData.coupons || []).findIndex(c => c.code === appliedCoupon.code);
-      if (cIdx >= 0) {
-        freshData.coupons[cIdx].usedCount += 1;
-        writeJSON(DATA_PATH, freshData);
+      const idx = data.coupons.findIndex(c => c.code === couponCode.toUpperCase() && c.type !== 'energy');
+      if (idx >= 0) {
+        const cp = data.coupons[idx];
+        let disc = Math.floor(finalPrice * (cp.discountRate / 100));
+        if (cp.maxDiscount > 0) disc = Math.min(disc, cp.maxDiscount);
+        finalPrice -= disc;
+        cp.usedCount += 1;
+        if (cp.usedCount >= cp.usageLimit) data.coupons.splice(idx, 1);
       }
     }
-
-    res.json({ success: true, ...result, finalPrice, originalPrice });
-  } catch (err) {
-    console.error('[구매 오류]', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    const token = new URL(tradeUrl).searchParams.get('token');
+    const resOffer = await bot.sendPurchaseOffer(req.session.steamUser.steamId, token, appId, finalPrice, quantity || 1);
+    writeJSON(DATA_PATH, data);
+    res.json({ success: true, ...resOffer });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ── 관리자 API ──
+app.get('/api/config', authMiddleware, (req, res) => res.json(readJSON(CONFIG_PATH, DEFAULT_CONFIG)));
+app.post('/api/config', authMiddleware, (req, res) => { writeJSON(CONFIG_PATH, req.body); res.json({ success: true }); });
+app.get('/api/data', authMiddleware, (req, res) => res.json(readJSON(DATA_PATH, DEFAULT_DATA)));
+app.post('/api/data', authMiddleware, (req, res) => { writeJSON(DATA_PATH, req.body); res.json({ success: true }); });
+app.get('/api/shop', (req, res) => {
+  const d = readJSON(DATA_PATH, DEFAULT_DATA), c = readJSON(CONFIG_PATH, DEFAULT_CONFIG);
+  if (!d.sets) d.sets = [];
+  res.json({ sets: d.sets.filter(s => s.listed && s.completeSets > 0), novelAiCost: c.novelAiCost });
+});
+app.get('/api/users', authMiddleware, (req, res) => {
+  const d = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!d.users) d.users = [];
+  res.json({ users: d.users });
+});
+app.post('/api/users/:sid/approve', authMiddleware, (req, res) => {
+  const data = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!data.users) data.users = [];
+  const u = data.users.find(x => x.steamId === req.params.sid);
+  if (u) { u.approved = true; writeJSON(DATA_PATH, data); }
+  res.json({ success: true });
+});
+app.delete('/api/users/:sid', authMiddleware, (req, res) => {
+  const data = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!data.users) data.users = [];
+  data.users = data.users.filter(x => x.steamId !== req.params.sid);
+  writeJSON(DATA_PATH, data);
+  res.json({ success: true });
+});
+app.get('/api/coupons', authMiddleware, (req, res) => {
+  const d = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!d.coupons) d.coupons = [];
+  res.json({ coupons: d.coupons });
+});
+app.post('/api/coupons', authMiddleware, (req, res) => {
+  const data = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!data.coupons) data.coupons = [];
+  const code = req.body.code.toUpperCase();
+  const idx = data.coupons.findIndex(c => c.code === code);
+  const newCp = { ...req.body, code, usedCount: idx >= 0 ? data.coupons[idx].usedCount : 0 };
+  if (idx >= 0) data.coupons[idx] = newCp; else data.coupons.push(newCp);
+  writeJSON(DATA_PATH, data); res.json({ success: true });
+});
+app.delete('/api/coupons/:code', authMiddleware, (req, res) => {
+  const data = readJSON(DATA_PATH, DEFAULT_DATA);
+  if (!data.coupons) data.coupons = [];
+  data.coupons = data.coupons.filter(c => c.code !== req.params.code.toUpperCase());
+  writeJSON(DATA_PATH, data);
+  res.json({ success: true });
+});
+
+app.get('/api/bot/status', authMiddleware, (req, res) => res.json(bot.getStatus()));
+app.post('/api/bot/login', authMiddleware, async (req, res) => { try { res.json(await bot.login()); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/bot/logoff', authMiddleware, (req, res) => { bot.logoff(); res.json({ success: true }); });
+app.post('/api/bot/restock', authMiddleware, async (req, res) => { try { res.json(await bot.sendRestockOfferAll()); } catch (e) { res.status(500).json({ error: e.message }); } });
 
 const distPath = path.join(__dirname, 'dist');
 app.use(express.static(distPath));
-app.get('/{*splat}', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+
+app.get(/^(?!\/api).+/, (req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+app.get('/', (req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
+});
 
 const PORT = parseInt(process.env.PORT) || 3002;
 app.listen(PORT, '0.0.0.0', () => {

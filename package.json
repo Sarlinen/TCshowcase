@@ -14,9 +14,11 @@
     "deploy": "npm run build && (pm2 restart ecosystem.config.cjs || pm2 start ecosystem.config.cjs)"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "axios": "^1.13.6",
     "cheerio": "^1.2.0",
     "clsx": "2.1.1",
+    "connect-redis": "^9.0.0",
     "express": "^5.2.1",
     "express-session": "^1.19.0",
     "react": "19.2.3",
